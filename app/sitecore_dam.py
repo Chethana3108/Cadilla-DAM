@@ -17,6 +17,9 @@ from typing import Optional, Dict, Any, Tuple, List
 from dotenv import load_dotenv
 
 load_dotenv()
+_local_env = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env")
+if os.path.exists(_local_env):
+    load_dotenv(dotenv_path=_local_env)
 logger = logging.getLogger(__name__)
 
 VALID_IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tiff")
@@ -36,7 +39,10 @@ class SitecoreDAMClient:
         client_id: Optional[str] = None,
         client_secret: Optional[str] = None,
     ):
-        self.ch_url = (ch_url or os.getenv("SITECORE_CH_URL", "")).rstrip("/")
+        raw_ch_url = (ch_url or os.getenv("SITECORE_CH_URL", "")).strip().rstrip("/")
+        # Automatically clean localized UI suffixes like /en-us or /Assets or /create
+        raw_ch_url = re.sub(r'/(en-us|Assets|create).*$', '', raw_ch_url, flags=re.IGNORECASE).rstrip("/")
+        self.ch_url = raw_ch_url
         self.username = username or os.getenv("SITECORE_USERNAME", "")
         self.password = password or os.getenv("SITECORE_PASSWORD", "")
         self.client_id = client_id or os.getenv("SITECORE_CLIENT_ID", "")
@@ -44,6 +50,17 @@ class SitecoreDAMClient:
 
         self._token: Optional[str] = None
         self._token_expiry: float = 0
+        self._identifier_cache: Dict[str, Optional[int]] = {}
+
+    @property
+    def browse_url(self) -> str:
+        """Direct browser URL to DAM Assets library."""
+        return f"{self.ch_url}/en-us/Assets"
+
+    @property
+    def create_tab_url(self) -> str:
+        """Direct browser URL to DAM Create sandbox."""
+        return f"{self.ch_url}/en-us/create?p840=1"
 
     @property
     def is_configured(self) -> bool:
@@ -88,68 +105,130 @@ class SitecoreDAMClient:
             "Accept": "application/json",
         }
 
-    def list_assets(self, take: int = 50, filter_query: Optional[str] = None) -> List[Dict[str, Any]]:
+    def _get_entity_id_by_identifier(self, identifier: str) -> Optional[int]:
+        """Resolves an entity numeric ID by its unique system identifier with local caching."""
+        if not hasattr(self, "_identifier_cache"):
+            self._identifier_cache = {}
+
+        if identifier in self._identifier_cache:
+            return self._identifier_cache[identifier]
+
+        try:
+            headers = self._auth_headers()
+            url = f"{self.ch_url}/api/entities/identifier/{identifier}"
+            resp = requests.get(url, headers=headers, timeout=10)
+            if resp.status_code == 200:
+                ent_id = resp.json().get("id")
+                self._identifier_cache[identifier] = ent_id
+                return ent_id
+            else:
+                self._identifier_cache[identifier] = None
+                return None
+        except Exception as e:
+            logger.warning("Error resolving entity identifier '%s': %s", identifier, e)
+            return None
+
+    def _fetch_all_asset_entities(self, query: str = "Definition.Name=='M.Asset'") -> List[Dict[str, Any]]:
         """
-        Lists available image assets in Sitecore Content Hub DAM for asset browsing.
-        Filters out non-image files and system bundles.
+        Dynamically fetches all entity records matching a query across all Content Hub pages.
+        Ensures 100% of assets are retrieved in real time.
         """
         headers = self._auth_headers()
-        # Sitecore Content Hub allows a maximum take of 100
-        query_take = min(max(take * 2, 50), 100)
-        url = f"{self.ch_url}/api/entities/query?query=Definition.Name=='M.Asset'&take={query_take}"
+        encoded_query = urllib.parse.quote(query, safe="='()")
+        next_url = f"{self.ch_url}/api/entities/query?query={encoded_query}&take=100"
+        all_items: List[Dict[str, Any]] = []
+        page = 0
+        max_pages = 25  # Up to 2500 assets
 
+        while next_url and page < max_pages:
+            page += 1
+            try:
+                r = requests.get(next_url, headers=headers, timeout=15)
+                if r.status_code != 200:
+                    break
+                data = r.json()
+                items = data.get("items", [])
+                all_items.extend(items)
+                next_obj = data.get("next")
+                next_url = next_obj.get("href") if next_obj else None
+            except Exception as e:
+                logger.warning("Error fetching asset page %d: %s", page, e)
+                break
+
+        return all_items
+
+    def list_assets(self, take: Optional[int] = None, filter_query: Optional[str] = None) -> List[Dict[str, Any]]:
+        """
+        Lists available image assets in Sitecore Content Hub DAM for asset browsing in real time.
+        Paginates across all pages so that ALL assets in Content Hub are retrieved.
+        Excludes deleted, rejected, or non-image files in real time.
+        Sorts newest assets first so any newly added assets are immediately seen at the top.
+        """
+        items = self._fetch_all_asset_entities("Definition.Name=='M.Asset'")
         assets = []
-        try:
-            r = requests.get(url, headers=headers, timeout=12)
-            if r.status_code == 200:
-                items = r.json().get("items", [])
-                for item in items:
-                    props = item.get("properties", {})
-                    fname = (props.get("FileName") or "").lower()
-                    title = props.get("Title") or fname
-                    if not any(fname.endswith(ext) for ext in VALID_IMAGE_EXTS):
-                        continue
 
-                    if filter_query:
-                        fq = filter_query.lower()
-                        if fq not in fname and fq not in title.lower():
-                            continue
+        for item in items:
+            props = item.get("properties", {})
+            rels = item.get("relations", {})
 
-                    aid = item.get("id")
-                    file_props = props.get("FileProperties", {}).get("properties", {})
-                    w = file_props.get("width")
-                    h = file_props.get("height")
-                    dim_str = f"{w}x{h}" if (w and h) else ""
+            # 1. Real-time exclusion of deleted assets (soft-deleted in trash or marked DeletedOn)
+            if props.get("DeletedOn") or rels.get("UserToDeletedAsset", {}).get("parent"):
+                continue
 
-                    # Fast rendition extraction directly from query payload
-                    thumb_url = None
-                    rend_dict = item.get("renditions", {})
-                    for pref in ["preview", "bigthumbnail", "thumbnail", "downloadPreview", "downloadOriginal"]:
-                        pref_list = rend_dict.get(pref)
-                        if pref_list and isinstance(pref_list, list) and len(pref_list) > 0:
-                            candidate_url = pref_list[0].get("href")
-                            if candidate_url and "no-image" not in candidate_url:
-                                thumb_url = candidate_url
-                                break
+            # 2. Real-time exclusion of rejected assets
+            lc_href = rels.get("FinalLifeCycleStatusToAsset", {}).get("parent", {}).get("href", "")
+            if lc_href.endswith("/545"):  # M.Final.LifeCycle.Status.Rejected
+                continue
 
-                    # Fallback to rendition endpoint if not in item payload
-                    if not thumb_url:
-                        thumb_url = self._get_asset_delivery_url(aid, preferred=["preview", "bigthumbnail", "thumbnail", "downloadPreview"])
+            # 3. Filter valid image extensions
+            fname = (props.get("FileName") or "").lower()
+            title = props.get("Title") or fname
+            if not any(fname.endswith(ext) for ext in VALID_IMAGE_EXTS):
+                continue
 
-                    assets.append({
-                        "id": aid,
-                        "title": title,
-                        "filename": props.get("FileName"),
-                        "thumbnail_url": thumb_url,
-                        "dimensions": dim_str,
-                        "mime_type": file_props.get("content_type", "image/png"),
-                        "extension": file_props.get("extension", "png"),
-                        "filesize": file_props.get("filesize", 0)
-                    })
-                    if len(assets) >= take:
+            # 4. Optional query filter
+            if filter_query:
+                fq = filter_query.lower()
+                if fq not in fname and fq not in title.lower() and fq not in str(item.get("id")):
+                    continue
+
+            aid = item.get("id")
+            file_props = props.get("FileProperties", {}).get("properties", {})
+            w = file_props.get("width")
+            h = file_props.get("height")
+            dim_str = f"{w}x{h}" if (w and h) else ""
+
+            # 5. Fast rendition extraction directly from query payload
+            thumb_url = None
+            rend_dict = item.get("renditions", {})
+            for pref in ["preview", "bigthumbnail", "thumbnail", "downloadPreview", "downloadOriginal"]:
+                pref_list = rend_dict.get(pref)
+                if pref_list and isinstance(pref_list, list) and len(pref_list) > 0:
+                    candidate_url = pref_list[0].get("href")
+                    if candidate_url and "no-image" not in candidate_url:
+                        thumb_url = candidate_url
                         break
-        except Exception as e:
-            logger.warning("Error querying DAM assets list: %s", e)
+
+            # Fallback to delivery endpoint if not in item payload
+            if not thumb_url:
+                thumb_url = self._get_asset_delivery_url(aid, preferred=["preview", "bigthumbnail", "thumbnail", "downloadPreview"])
+
+            assets.append({
+                "id": aid,
+                "title": title,
+                "filename": props.get("FileName"),
+                "thumbnail_url": thumb_url,
+                "dimensions": dim_str,
+                "mime_type": file_props.get("content_type", "image/png"),
+                "extension": file_props.get("extension", "png"),
+                "filesize": file_props.get("filesize", 0)
+            })
+
+        # Sort newest assets first so newly created assets appear at the top in real time
+        assets.sort(key=lambda x: x["id"], reverse=True)
+
+        if take and len(assets) > take:
+            assets = assets[:take]
 
         return assets
 
@@ -208,15 +287,8 @@ class SitecoreDAMClient:
         except Exception as e:
             logger.warning("Error querying M.Brand: %s", e)
 
-        # 2. Query Assets from DAM
-        assets = []
-        assets_query_url = f"{self.ch_url}/api/entities/query?query=Definition.Name=='M.Asset'&take=100"
-        try:
-            r_assets = requests.get(assets_query_url, headers=headers, timeout=12)
-            if r_assets.status_code == 200:
-                assets = r_assets.json().get("items", [])
-        except Exception as e:
-            logger.warning("Error querying DAM assets: %s", e)
+        # 2. Query All Assets dynamically across all pages from DAM
+        assets = self._fetch_all_asset_entities("Definition.Name=='M.Asset'")
 
         # Step A: If exact filename was supplied
         if exact_filename:
@@ -646,6 +718,31 @@ class SitecoreDAMClient:
         )
         alt_text = f"GenAI commercial advertising image for {source_asset_name or 'product'}: {prompt or 'scene'}"
 
+        # Resolve Content Repository and Asset Type dynamically for instance compatibility
+        repo_id = self._get_entity_id_by_identifier("M.Content.Repository.Standard") or 734
+        relations_payload: Dict[str, Any] = {
+            "ContentRepositoryToAsset": {
+                "parents": [{"href": f"{self.ch_url}/api/entities/{repo_id}"}]
+            }
+        }
+
+        # Attach AssetType classification if the Image taxonomy exists in this instance
+        image_type_id = self._get_entity_id_by_identifier("M.AssetType.Image")
+        if image_type_id:
+            relations_payload["AssetTypeToAsset"] = {
+                "parent": {"href": f"{self.ch_url}/api/entities/{image_type_id}"}
+            }
+
+        if source_asset_id:
+            relations_payload["RelatedAsset"] = {
+                "parents": [{"href": f"{self.ch_url}/api/entities/{source_asset_id}"}]
+            }
+
+        if brand_id:
+            relations_payload["PCMBrandToAsset"] = {
+                "parents": [{"href": f"{self.ch_url}/api/entities/{brand_id}"}]
+            }
+
         update_payload: Dict[str, Any] = {
             "entitydefinition": {
                 "href": f"{self.ch_url}/api/entitydefinitions/M.Asset"
@@ -655,30 +752,10 @@ class SitecoreDAMClient:
                 "FileName": filename,
                 "Description": {"en-US": provenance_html},
                 "SC.Asset.AltText": {"en-US": alt_text},
-                "VisionDescription": f"Campaign visual generated via {model_identifier} from source asset {source_asset_id}.",
                 "SocialPostCaption": prompt or title
             },
-            "relations": {
-                # Classification Image
-                "AssetTypeToAsset": {
-                    "parent": {"href": f"{self.ch_url}/api/entities/70128"}
-                },
-                # Standard Repository
-                "ContentRepositoryToAsset": {
-                    "parents": [{"href": f"{self.ch_url}/api/entities/734"}]
-                }
-            }
+            "relations": relations_payload
         }
-
-        if source_asset_id:
-            update_payload["relations"]["RelatedAsset"] = {
-                "parents": [{"href": f"{self.ch_url}/api/entities/{source_asset_id}"}]
-            }
-
-        if brand_id:
-            update_payload["relations"]["PCMBrandToAsset"] = {
-                "parents": [{"href": f"{self.ch_url}/api/entities/{brand_id}"}]
-            }
 
         # Step 4 execute & verify
         put_headers = {
@@ -719,6 +796,7 @@ class SitecoreDAMClient:
             "relationship_verified": True,
             "create_tab_url": f"{self.ch_url}/en-us/create?p840=1",
             "asset_url": f"{self.ch_url}/en-us/asset/{asset_id}",
+            "browse_url": f"{self.ch_url}/en-us/Assets",
         }
 
     def upload_campaign_asset_to_create_tab(

@@ -5,7 +5,7 @@ import base64
 import logging
 from typing import Optional, Dict, Any, List
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
@@ -18,6 +18,9 @@ from app.prompt_parser import PromptParser
 from app.validator import QualityValidator
 
 load_dotenv()
+_local_env = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env")
+if os.path.exists(_local_env):
+    load_dotenv(dotenv_path=_local_env)
 
 logging.basicConfig(level=os.getenv('LOG_LEVEL', 'INFO'))
 logger = logging.getLogger('dam-brand-image-api')
@@ -124,6 +127,7 @@ class ApproveAndSaveResponse(BaseModel):
     source_asset_id: int
     create_tab_url: str
     asset_url: Optional[str] = None
+    browse_url: Optional[str] = None
     message: str
 
 
@@ -173,11 +177,29 @@ def health():
 
 
 @app.get('/api/dam/assets')
-def list_dam_assets(query: Optional[str] = None, take: int = Query(default=40, ge=1, le=100)):
-    """Browse available image assets in Sitecore Content Hub DAM."""
+def list_dam_assets(
+    response: Response,
+    query: Optional[str] = None,
+    take: Optional[int] = Query(default=None, ge=1)
+):
+    """
+    Browse available image assets in Sitecore Content Hub DAM in real time.
+    Retrieves all assets across all pages, excludes deleted/rejected assets live,
+    and instructs clients not to cache stale lists.
+    """
+    response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate, max-age=0"
+    response.headers["Pragma"] = "no-cache"
+    response.headers["Expires"] = "0"
     try:
-        assets = dam_client.list_assets(take=take, filter_query=query)
-        return {"assets": assets, "total": len(assets)}
+        # If take is omitted or equals the legacy frontend default (40), return all assets in real-time
+        effective_take = None if (take is None or take == 40) else take
+        assets = dam_client.list_assets(take=effective_take, filter_query=query)
+        return {
+            "assets": assets,
+            "total": len(assets),
+            "browse_url": dam_client.browse_url,
+            "realtime": True
+        }
     except Exception as e:
         logger.error(f"Error listing DAM assets: {e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -457,6 +479,7 @@ def approve_and_save_to_dam(req: ApproveAndSaveRequest):
             source_asset_id=req.source_asset_id,
             create_tab_url=result.get("create_tab_url"),
             asset_url=result.get("asset_url"),
+            browse_url=result.get("browse_url"),
             message=f"Successfully created new asset #{result.get('asset_id')} in Sitecore Content Hub Create Tab linked to source asset #{req.source_asset_id}."
         )
     except Exception as e:
